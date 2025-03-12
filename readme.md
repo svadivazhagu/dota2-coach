@@ -151,7 +151,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## License
 
-[MIT License](LICENSE)
+[Mozilla Public License Version 2.0](LICENSE)
 
 ## Acknowledgments
 
