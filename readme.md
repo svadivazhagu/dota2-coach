@@ -1,6 +1,6 @@
 # Dota 2 Coach
 
-A real-time coaching tool for Dota 2 players that leverages Game State Integration (GSI) to provide actionable insights during gameplay.
+A real-time CLI coaching tool for Dota 2 players that leverages Game State Integration (GSI) to provide actionable insights during gameplay.
 
 ## Features
 
@@ -12,8 +12,8 @@ A real-time coaching tool for Dota 2 players that leverages Game State Integrati
 - **Timing Reminders**: Provides timely reminders for stacking camps, rune spawns, and other time-sensitive objectives
 
 ## Screenshots
+![Screenshot showing terminal use](demo.png "Example v1.0 use")
 
-[Coming Soon]
 
 ## Installation
 
