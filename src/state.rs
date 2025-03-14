@@ -1,6 +1,8 @@
 // src/state.rs
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use chrono;
+use std::fs;
 
 // Root game state structure
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -232,17 +234,14 @@ pub fn extract_enemy_heroes(state: &GameState) -> HashMap<String, EnemyHero> {
                     // Format the hero name to be more readable
                     let hero_name = format_hero_name(name);
                     
-                    // Try to find the hero in the state if available
+                    // Try to get health/mana info from other parts of the game state
+                    // Look for this hero in the hero entities if available
                     let mut health = None;
-                    let mut max_health = None;
                     let mut health_percent = None;
                     let mut mana = None;
-                    let mut max_mana = None;
                     let mut mana_percent = None;
-                    
-                    // Look for health/mana info in the game state if available
-                    // This is an approximation since the GSI doesn't directly give enemy hero details
-                    // In a real implementation, you'd gather this data from observations or game events
+                    let mut max_health = None;
+                    let mut max_mana = None;
                     
                     // For now, we'll set placeholder values based on level and game time
                     // A more robust implementation would track actual data from fights/observations
@@ -293,4 +292,92 @@ pub fn estimate_hero_level(game_time: i32) -> i32 {
     } else {
         (minutes / 3) + 5
     }
+}
+
+// More in-depth debug function to explore GSI data structure
+// This function doesn't print to stdout, instead saves data to files
+pub fn explore_gsi_data(state: &GameState) -> Option<serde_json::Value> {
+    // Create a path for debug output
+    let _ = fs::create_dir_all("debug_output");
+    
+    // Check for hero health data in various places
+    let mut debug_info = serde_json::json!({
+        "timestamp": chrono::Local::now().to_rfc3339(),
+        "game_time": state.map.as_ref().and_then(|m| m.game_time),
+        "found_health_data": false,
+        "keys": {}
+    });
+    
+    // Look for hero-related data in different places
+    for (key, value) in &state.other {
+        if key.contains("hero") || key.contains("health") || key.contains("player") {
+            // Add to debug output
+            debug_info["keys"][key] = value.clone();
+            
+            // Note if we find health data
+            if let serde_json::Value::Object(obj) = value {
+                if obj.contains_key("health") || obj.contains_key("health_percent") {
+                    debug_info["found_health_data"] = serde_json::json!(true);
+                    debug_info["health_data_keys"] = serde_json::json!([key]);
+                }
+            }
+        }
+    }
+    
+    // Save debug info to file without printing to console
+    if let Some(game_time) = state.map.as_ref().and_then(|m| m.game_time) {
+        let filename = format!("debug_output/gsi_data_{}.json", game_time);
+        if let Ok(json_str) = serde_json::to_string_pretty(&debug_info) {
+            let _ = fs::write(&filename, json_str);
+        }
+    }
+    
+    Some(debug_info)
+}
+
+// Debug function that logs to file instead of stdout
+pub fn debug_game_state(state: &GameState) {
+    // Create debug directory if it doesn't exist
+    let _ = fs::create_dir_all("debug_logs");
+    
+    // Format current time for the log filename
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    let game_time = state.map.as_ref()
+        .and_then(|m| m.game_time)
+        .map(|t| format!("_{}", t))
+        .unwrap_or_default();
+    
+    let filename = format!("debug_logs/game_state{}{}.log", game_time, timestamp);
+    
+    // Create log content
+    let mut log_content = String::new();
+    log_content.push_str("=== GAME STATE DEBUG LOG ===\n\n");
+    
+    // Add game time
+    if let Some(map) = &state.map {
+        if let Some(time) = map.game_time {
+            log_content.push_str(&format!("Game Time: {}\n", format_game_time(Some(time))));
+        }
+    }
+    
+    // Other fields in game state
+    log_content.push_str("\nOther fields in game state:\n");
+    for (key, value) in &state.other {
+        if key.contains("hero") || key.contains("health") {
+            log_content.push_str(&format!("Key: {} = {:?}\n", key, value));
+        }
+    }
+    
+    // Minimap objects
+    if let Some(ref minimap) = state.minimap {
+        log_content.push_str("\nMinimap objects:\n");
+        for (key, obj) in minimap {
+            if obj.image == "minimap_enemyicon" {
+                log_content.push_str(&format!("Enemy icon key: {} = {:?}\n", key, obj));
+            }
+        }
+    }
+    
+    // Write to file without printing to console
+    let _ = fs::write(filename, log_content);
 }

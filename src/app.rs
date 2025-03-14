@@ -69,6 +69,12 @@ impl App {
                 .and_then(|m| m.game_time)
                 .unwrap_or(0);
             
+            // Debug output every 30 seconds to find health data
+            if self.game_time % 30 == 0 {
+                crate::state::debug_game_state(&game_state);
+                crate::state::explore_gsi_data(&game_state);
+            }
+            
             // Update enemy heroes
             let new_enemy_heroes = extract_enemy_heroes(&game_state);
             

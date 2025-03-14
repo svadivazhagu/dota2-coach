@@ -38,6 +38,18 @@ pub async fn start_server(
                         let mut gs = game_state_clone.lock().unwrap();
                         *gs = Some(state);
                     }
+                    
+                    // Log any unusual keys that might contain health info
+                    let keys = data.as_object().map(|obj| {
+                        obj.keys().filter(|k| k.contains("hero") || k.contains("health"))
+                           .collect::<Vec<_>>()
+                    });
+                    
+                    if let Some(important_keys) = keys {
+                        if !important_keys.is_empty() {
+                            //println!("Found potential health-related keys: {:?}", important_keys);
+                        }
+                    }
                 },
                 Err(e) => {
                     eprintln!("Error parsing game state: {}", e);
