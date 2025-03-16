@@ -112,7 +112,7 @@
  */
 
  #[derive(Clone, Debug, Deserialize, Serialize)]
- struct GameState {
+ struct GameState { 
      provider: Option<Provider>,
      map: Option<Map>,
      player: Option<Player>,

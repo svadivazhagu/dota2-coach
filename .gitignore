@@ -1,1 +1,4 @@
 /target
+/debug_logs
+/debug_output
+*.json
