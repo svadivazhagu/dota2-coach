@@ -1,6 +1,5 @@
 // src/bin/coach.rs
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 use warp::Filter;
 use serde::{Deserialize, Serialize};
@@ -80,6 +79,16 @@ struct EnemyHeroState {
     last_seen_time: i32,
     estimated_level: i32,
     times_spotted: i32,
+    status: EnemyStatus,
+}
+
+// Status tracking for enemy heroes
+#[derive(Clone, Debug, PartialEq)]
+enum EnemyStatus {
+    NewlySpotted,
+    Tracking,
+    MovedSignificantly,
+    Lost,
 }
 
 // Format game time from seconds to MM:SS format
@@ -114,6 +123,66 @@ fn calculate_distance(pos1: (i32, i32), pos2: (i32, i32)) -> f32 {
     let dx = pos1.0 - pos2.0;
     let dy = pos1.1 - pos2.1;
     ((dx * dx + dy * dy) as f32).sqrt()
+}
+
+// Describe a position relative to player
+fn describe_position_relative_to_player(player_pos: (i32, i32), enemy_pos: (i32, i32)) -> String {
+    let distance = calculate_distance(player_pos, enemy_pos);
+    
+    // Determine the direction
+    let dx = enemy_pos.0 - player_pos.0;
+    let dy = enemy_pos.1 - player_pos.1;
+    
+    let direction = if dx.abs() > dy.abs() * 2.0 as i32 {
+        if dx > 0 { "east" } else { "west" }
+    } else if dy.abs() > dx.abs() * 2.0 as i32 {
+        if dy > 0 { "north" } else { "south" }
+    } else if dx > 0 && dy > 0 {
+        "northeast"
+    } else if dx > 0 && dy < 0 {
+        "southeast"
+    } else if dx < 0 && dy > 0 {
+        "northwest"
+    } else {
+        "southwest"
+    };
+    
+    // Determine distance description
+    let distance_desc = if distance < 1000.0 {
+        "very close to you".red().bold().to_string()
+    } else if distance < 2000.0 {
+        "nearby".yellow().to_string()
+    } else if distance < 4000.0 {
+        "at medium distance".to_string()
+    } else {
+        "far away".green().to_string()
+    };
+    
+    format!("{} to the {}", distance_desc, direction)
+}
+
+// Convert map position to a named location (approximate)
+fn describe_map_location(position: (i32, i32)) -> String {
+    // These are very approximate location markers
+    let x = position.0;
+    let y = position.1;
+
+    // Simple map quadrants
+    if x > 5000 && y > 5000 {
+        "Radiant jungle".to_string()
+    } else if x > 3000 && y < -3000 {
+        "Dire jungle".to_string()
+    } else if x.abs() < 3000 && y.abs() < 3000 {
+        "mid lane area".to_string()
+    } else if x > 0 && y > 0 {
+        "Radiant top lane".to_string()
+    } else if x < 0 && y > 0 {
+        "Radiant bottom lane".to_string()
+    } else if x > 0 && y < 0 {
+        "Dire top lane".to_string()
+    } else {
+        "Dire bottom lane".to_string()
+    }
 }
 
 // Estimate hero level based on game time
@@ -157,6 +226,11 @@ fn save_game_state(state: &GameState, enemy_states: &HashMap<String, EnemyHeroSt
     }
 }
 
+// Check if enemy has moved significantly
+fn has_moved_significantly(old_pos: (i32, i32), new_pos: (i32, i32)) -> bool {
+    calculate_distance(old_pos, new_pos) > 1000.0
+}
+
 #[tokio::main]
 async fn main() {
     println!("{}", "Dota 2 Coach - Enemy Tracking".green().bold());
@@ -166,10 +240,14 @@ async fn main() {
     // Create shared state
     let game_state = Arc::new(Mutex::new(None::<GameState>));
     let enemy_states = Arc::new(Mutex::new(HashMap::<String, EnemyHeroState>::new()));
+    let last_game_time = Arc::new(Mutex::new(-1));
+    let enemy_team_heroes = Arc::new(Mutex::new(Vec::<String>::new()));
     
     // Clones for the server endpoint
     let game_state_clone = game_state.clone();
     let enemy_states_clone = enemy_states.clone();
+    let last_game_time_clone = last_game_time.clone();
+    let enemy_team_heroes_clone = enemy_team_heroes.clone();
     
     // Set up an endpoint to receive GSI data
     let gsi_endpoint = warp::post()
@@ -179,10 +257,19 @@ async fn main() {
             // Parse the incoming JSON
             match serde_json::from_value::<GameState>(data.clone()) {
                 Ok(state) => {
-                    // Update enemy information
+                    // Get current game time
                     let current_game_time = state.map.as_ref()
                         .and_then(|m| m.game_time)
                         .unwrap_or(0);
+                    
+                    // Check if this is a new game time to avoid processing duplicates
+                    {
+                        let mut last_time = last_game_time_clone.lock().unwrap();
+                        if *last_time == current_game_time {
+                            return "OK";
+                        }
+                        *last_time = current_game_time;
+                    }
                     
                     // Determine player's team
                     let player_team = state.player.as_ref()
@@ -207,11 +294,40 @@ async fn main() {
                         }
                     }
                     
+                    // Get player position for relative directions
+                    let player_position = if let Some(hero) = &state.hero {
+                        match (hero.xpos, hero.ypos) {
+                            (Some(x), Some(y)) => Some((x, y)),
+                            _ => None
+                        }
+                    } else {
+                        None
+                    };
+                    
                     // Update enemy states with the collected data
                     {
                         let mut enemy_map = enemy_states_clone.lock().unwrap();
                         
+                        // First mark all enemies as potentially lost
+                        for (_, enemy) in enemy_map.iter_mut() {
+                            if enemy.status != EnemyStatus::Lost && current_game_time - enemy.last_seen_time > 10 {
+                                enemy.status = EnemyStatus::Lost;
+                            }
+                        }
+                        
+                        // Then update with current sightings
                         for (name, position) in visible_enemies {
+                            let was_already_tracked = enemy_map.contains_key(&name);
+                            let mut status = EnemyStatus::Tracking;
+                            
+                            if !was_already_tracked {
+                                status = EnemyStatus::NewlySpotted;
+                            } else if let Some(existing) = enemy_map.get(&name) {
+                                if has_moved_significantly(existing.last_seen_position, position) {
+                                    status = EnemyStatus::MovedSignificantly;
+                                }
+                            }
+                            
                             let times_spotted = enemy_map.get(&name)
                                 .map(|existing| existing.times_spotted + 1)
                                 .unwrap_or(1);
@@ -223,7 +339,96 @@ async fn main() {
                                 last_seen_time: current_game_time,
                                 estimated_level: estimate_hero_level(current_game_time),
                                 times_spotted,
+                                status,
                             });
+                            
+                            // Add to enemy team heroes list if not already there
+                            let mut enemy_heroes = enemy_team_heroes_clone.lock().unwrap();
+                            if !enemy_heroes.contains(&name) {
+                                enemy_heroes.push(name.clone());
+                                
+                                // Print updated enemy team list whenever we discover a new hero
+                                println!("\n[{}] {}: {} spotted for the first time. Now tracking {} enemies:", 
+                                    format_game_time(Some(current_game_time)),
+                                    "ENEMY HERO DISCOVERED".magenta().bold(),
+                                    name.yellow().bold(),
+                                    enemy_heroes.len());
+                                    
+                                for (i, hero_name) in enemy_heroes.iter().enumerate() {
+                                    println!("  {}. {}", i+1, hero_name.yellow());
+                                }
+                                println!();
+                            }
+                        }
+                        
+                        // Process enemy states to generate text updates
+                        if player_position.is_some() {
+                            for (name, enemy) in enemy_map.iter() {
+                                let time_str = format_game_time(Some(current_game_time));
+                                
+                                match enemy.status {
+                                    EnemyStatus::NewlySpotted => {
+                                        let location = if let Some(pos) = player_position {
+                                            describe_position_relative_to_player(pos, enemy.last_seen_position)
+                                        } else {
+                                            describe_map_location(enemy.last_seen_position)
+                                        };
+                                        
+                                        println!("[{}] {}: {} {} (Level {}) spotted {}", 
+                                            time_str,
+                                            "ENEMY SPOTTED".red().bold(),
+                                            name.yellow().bold(),
+                                            if enemy.times_spotted > 1 { "reappeared" } else { "appeared" },
+                                            enemy.estimated_level,
+                                            location);
+                                    },
+                                    EnemyStatus::MovedSignificantly => {
+                                        if let Some(pos) = player_position {
+                                            let location = describe_position_relative_to_player(pos, enemy.last_seen_position);
+                                            println!("[{}] {}: {} is moving, now {}", 
+                                                time_str,
+                                                "ENEMY MOVEMENT".yellow(),
+                                                name.yellow(),
+                                                location);
+                                        }
+                                    },
+                                    EnemyStatus::Lost => {
+                                        println!("[{}] {}: Lost track of {}, last seen {} seconds ago", 
+                                            time_str,
+                                            "ENEMY MISSING".blue(),
+                                            name,
+                                            current_game_time - enemy.last_seen_time);
+                                    },
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Check for low health buildings
+                    if let Some(buildings) = &state.buildings {
+                        let enemy_team_key = if player_team == "radiant" { "dire" } else { "radiant" };
+                        
+                        if let Some(enemy_buildings) = buildings.get(enemy_team_key) {
+                            let time_str = format_game_time(Some(current_game_time));
+                            
+                            for (name, building) in enemy_buildings {
+                                let health_percent = (building.health as f32 / building.max_health as f32 * 100.0) as i32;
+                                
+                                // Only alert for low health buildings
+                                if health_percent <= 30 {
+                                    // Format building name for better readability
+                                    let building_name = name.replace("dota_goodguys_", "")
+                                        .replace("dota_badguys_", "")
+                                        .replace("_", " ");
+                                    
+                                    println!("[{}] {}: Enemy {} at {}% health", 
+                                        time_str,
+                                        "OBJECTIVE".green().bold(),
+                                        building_name.green(),
+                                        health_percent);
+                                }
+                            }
                         }
                     }
                     
@@ -240,7 +445,7 @@ async fn main() {
         });
     
     // Start the webserver in a separate thread
-    let server_thread = tokio::spawn(async move {
+    let _server_thread = tokio::spawn(async move {
         warp::serve(gsi_endpoint)
             .run(([127, 0, 0, 1], 3000))
             .await;
@@ -249,212 +454,46 @@ async fn main() {
     println!("{}", "Server running! Waiting for Dota 2 data...".yellow());
     println!("{}", "Make sure you have configured the GSI config file in Dota 2.".yellow());
     println!("{}", "Add -gamestateintegration to Dota 2 launch options".yellow());
+    println!();
+    println!("{}", "Enemy activity will stream below as it happens...".green());
+    println!("{}", "======================================================".green());
     
-    // Create a thread for displaying information
-    let display_thread = thread::spawn(move || {
-        let mut last_update_time = std::time::Instant::now();
-        let mut last_save_time = std::time::Instant::now();
+    // Print the current enemy team composition command
+    // Periodically display enemy team composition
+    let enemy_team_heroes_display = enemy_team_heroes.clone();
+    let last_time_clone = last_game_time.clone();
+    tokio::spawn(async move {
+        let mut last_display_time = 0;
         
         loop {
-            // Only update display every 1 second
-            if last_update_time.elapsed() >= Duration::from_secs(1) {
-                // Try to get the current game state
-                let state_option = {
-                    let state = game_state.lock().unwrap();
-                    state.clone()
-                };
-                
-                // Get enemy hero states
-                let enemy_state_data = {
-                    let enemy_map = enemy_states.lock().unwrap();
-                    enemy_map.clone()
-                };
-                
-                // Display information
-                if let Some(state) = state_option.clone() {
-                    display_game_information(&state, &enemy_state_data);
-                    last_update_time = std::time::Instant::now();
+            tokio::time::sleep(Duration::from_secs(60)).await; // Display every minute
+            
+            // Get current game time
+            let current_time = *last_time_clone.lock().unwrap();
+            
+            // Only display if game time has progressed and it's been at least a minute since last display
+            if current_time > 0 && current_time > last_display_time + 60 {
+                let heroes = enemy_team_heroes_display.lock().unwrap();
+                if !heroes.is_empty() {
+                    println!("\n[{}] {}: ", 
+                        format_game_time(Some(current_time)),
+                        "ENEMY TEAM SUMMARY".cyan().bold());
                     
-                    // Save state every 5 minutes
-                    if last_save_time.elapsed() >= Duration::from_secs(300) {
-                        if let Some(ref state) = state_option {
-                            save_game_state(state, &enemy_state_data);
-                        }
-                        last_save_time = std::time::Instant::now();
+                    for (i, hero) in heroes.iter().enumerate() {
+                        println!("  {}. {}", i+1, hero.yellow());
                     }
+                    println!();
+                    
+                    last_display_time = current_time;
                 }
             }
-            
-            // Sleep to avoid excessive CPU usage
-            thread::sleep(Duration::from_millis(100));
         }
     });
     
-    // Wait for the threads to complete (they won't in normal operation)
-    display_thread.join().unwrap();
-    server_thread.abort();
-}
-
-// Display game information
-fn display_game_information(state: &GameState, enemy_states: &HashMap<String, EnemyHeroState>) {
-    // Clear screen
-    print!("\x1B[2J\x1B[1;1H");
-    
-    println!("{}", "DOTA 2 GAME STATUS".green().bold());
-    println!("{}", "=================".green());
-    
-    // Display game time
-    if let Some(map) = &state.map {
-        println!("\n{}", "GAME TIME".yellow().bold());
-        println!("Time: {}", format_game_time(map.game_time));
-        println!("State: {}", map.game_state.as_deref().unwrap_or("Unknown"));
-        println!("Environment: {}", 
-            if map.daytime.unwrap_or(true) { "Day".bright_blue() } else { "Night".blue() });
+    // Keep main thread alive
+    println!("Press Ctrl+C to exit");
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => println!("Shutting down server..."),
+        Err(err) => eprintln!("Error listening for Ctrl+C: {}", err),
     }
-    
-    // Get player team
-    let player_team = state.player.as_ref()
-        .and_then(|p| p.team_name.as_ref())
-        .map(|t| t.to_lowercase())
-        .unwrap_or_else(|| "unknown".to_string());
-    
-    let enemy_team_name = if player_team == "radiant" { "Dire" } else { "Radiant" };
-    
-    // Get player position
-    let player_position = if let Some(hero) = &state.hero {
-        match (hero.xpos, hero.ypos) {
-            (Some(x), Some(y)) => Some((x, y)),
-            _ => None
-        }
-    } else {
-        None
-    };
-    
-    // Display enemy heroes with persistent tracking
-    println!("\n{}", "ENEMY HEROES".red().bold());
-    println!("{}", "============".red());
-    
-    if enemy_states.is_empty() {
-        println!("No enemy heroes detected yet");
-    } else {
-        // Get current game time
-        let current_game_time = state.map.as_ref()
-            .and_then(|m| m.game_time)
-            .unwrap_or(0);
-        
-        // Sort enemies by last seen time (most recent first)
-        let mut sorted_enemies: Vec<_> = enemy_states.values().collect();
-        sorted_enemies.sort_by(|a, b| b.last_seen_time.cmp(&a.last_seen_time));
-        
-        for hero in sorted_enemies {
-            // Calculate time since last seen
-            let seconds_since_seen = current_game_time - hero.last_seen_time;
-            
-            let name_display = if seconds_since_seen < 5 {
-                format!("{} (Level {})", hero.name, hero.estimated_level)
-            } else if seconds_since_seen < 30 {
-                format!("{} (Level {})", hero.name, hero.estimated_level)
-            } else {
-                format!("{} (Est. Level {})", hero.name, hero.estimated_level)
-            };
-            
-            // Use proper colored formatting
-            if seconds_since_seen < 5 {
-                println!("Hero: {}", name_display.red().bold());
-            } else if seconds_since_seen < 30 {
-                println!("Hero: {}", name_display.yellow());
-            } else {
-                println!("Hero: {}", name_display);
-            }
-            
-            println!("  Last seen: {} ({} seconds ago)", 
-                format_game_time(Some(hero.last_seen_time)),
-                seconds_since_seen);
-            
-            println!("  Position: ({}, {})", hero.last_seen_position.0, hero.last_seen_position.1);
-            
-            // Show relative distance if player position is available
-            if let Some(player_pos) = player_position {
-                let distance = calculate_distance(player_pos, hero.last_seen_position);
-                
-                if distance < 1000.0 {
-                    println!("  Distance from you: {} ({:.0} units)", "VERY CLOSE!".red().bold(), distance);
-                } else if distance < 2000.0 {
-                    println!("  Distance from you: {} ({:.0} units)", "Nearby".yellow(), distance);
-                } else if distance < 4000.0 {
-                    println!("  Distance from you: {} ({:.0} units)", "Medium distance", distance);
-                } else {
-                    println!("  Distance from you: {} ({:.0} units)", "Far away".green(), distance);
-                }
-            }
-            
-            println!("  Times spotted: {}", hero.times_spotted);
-            println!();
-        }
-    }
-    
-    // Display building status
-    println!("\n{}", "BUILDING STATUS".yellow().bold());
-    println!("{}", "===============".yellow());
-    
-    if let Some(buildings) = &state.buildings {
-        // Display player team buildings
-        let player_team_key = if player_team == "radiant" { "radiant" } else { "dire" };
-        println!("{}", format!("YOUR TEAM ({})", player_team.to_uppercase()).green().bold());
-        
-        if let Some(team_buildings) = buildings.get(player_team_key) {
-            for (name, building) in team_buildings {
-                let health_percent = (building.health as f32 / building.max_health as f32 * 100.0) as i32;
-                
-                let health_display = if health_percent > 70 {
-                    format!("{}%", health_percent).green()
-                } else if health_percent > 30 {
-                    format!("{}%", health_percent).yellow()
-                } else {
-                    format!("{}%", health_percent).red()
-                };
-                
-                // Format building name for better readability
-                let building_name = name.replace("dota_goodguys_", "")
-                    .replace("dota_badguys_", "")
-                    .replace("_", " ");
-                
-                println!("• {}: {}", building_name, health_display);
-            }
-        } else {
-            println!("No building data available");
-        }
-        
-        // Display enemy team buildings
-        println!();
-        println!("{}", format!("ENEMY TEAM ({})", enemy_team_name.to_uppercase()).red().bold());
-        
-        let enemy_team_key = if player_team == "radiant" { "dire" } else { "radiant" };
-        if let Some(team_buildings) = buildings.get(enemy_team_key) {
-            for (name, building) in team_buildings {
-                let health_percent = (building.health as f32 / building.max_health as f32 * 100.0) as i32;
-                
-                let health_display = if health_percent > 70 {
-                    format!("{}%", health_percent).green()
-                } else if health_percent > 30 {
-                    format!("{}%", health_percent).yellow()
-                } else {
-                    format!("{}%", health_percent).red()
-                };
-                
-                // Format building name for better readability
-                let building_name = name.replace("dota_goodguys_", "")
-                    .replace("dota_badguys_", "")
-                    .replace("_", " ");
-                
-                println!("• {}: {}", building_name, health_display);
-            }
-        } else {
-            println!("No building data available");
-        }
-    } else {
-        println!("No building data available");
-    }
-    
-    println!("\nTracking enemy data for analysis. Press Ctrl+C to exit.");
 }
